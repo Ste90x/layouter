@@ -55,7 +55,34 @@ type ResizeRecord = {
   to: ResizeDimensions;
 };
 
-type MoveRecord = DomMoveRecord | DomGroupRecord | TransformRecord | TransformGroupRecord | ResizeRecord;
+type BorderRadiusRecord = {
+  kind: "borderRadius";
+  element: HTMLElement;
+  from: string;
+  to: string;
+};
+
+type DeleteRecord = {
+  kind: "delete";
+  elements: Element[];
+  from: ElementLocation[];
+};
+
+type UnwrapRecord = {
+  kind: "unwrap";
+  children: ChildNode[];
+  element: Element;
+  from: ElementLocation;
+};
+
+type TextRecord = {
+  kind: "text";
+  element: Element;
+  from: ChildNode[];
+  to: string;
+};
+
+type MoveRecord = DomMoveRecord | DomGroupRecord | TransformRecord | TransformGroupRecord | ResizeRecord | BorderRadiusRecord | DeleteRecord | UnwrapRecord | TextRecord;
 
 export type TransformChange = {
   element: Element;
@@ -67,7 +94,11 @@ export type DomMoveSession = {
   status(): SessionStatus;
   move(element: Element, target: Element, position: DropPosition): boolean;
   moveGroup(elements: Element[], target: Element, position: DropPosition): boolean;
+  deleteElements(elements: Element[]): boolean;
+  unwrapElement(element: Element): boolean;
+  replaceText(element: Element, text: string, originalChildren?: ChildNode[]): boolean;
   resize(element: Element, dimensions: ResizeDimensions): boolean;
+  borderRadius(element: Element, borderRadius: string): boolean;
   transform(element: Element, transform: string): boolean;
   transformGroup(changes: TransformChange[]): boolean;
   undo(): boolean;
@@ -99,6 +130,21 @@ export function isAllowedGroupMove(elements: Element[], target: Element): boolea
   if (elements.length === 0) return false;
   if (isCriticalElement(target) || !isVisibleElement(target) || target.closest("[data-layouter-extension-root]")) return false;
   return elements.every((element) => isAllowedMove(element, target));
+}
+
+export function isAllowedDelete(element: Element): boolean {
+  if (isCriticalElement(element)) return false;
+  if (!element.parentNode) return false;
+  if (element.closest("[data-layouter-extension-root]")) return false;
+  return true;
+}
+
+export function isAllowedUnwrap(element: Element): boolean {
+  return isAllowedDelete(element) && element.childNodes.length > 0;
+}
+
+export function isAllowedTextEdit(element: Element): boolean {
+  return !isCriticalElement(element) && !element.closest("[data-layouter-extension-root]");
 }
 
 export function createDomMoveSession(): DomMoveSession {
@@ -158,6 +204,33 @@ export function createDomMoveSession(): DomMoveSession {
     }
   }
 
+  function detachGroup(elements: Element[]): void {
+    for (const element of elements) {
+      element.parentNode?.removeChild(element);
+    }
+  }
+
+  function unwrap(element: Element): ChildNode[] {
+    const parent = element.parentNode!;
+    const children = [...element.childNodes];
+    for (const child of children) {
+      parent.insertBefore(child, element);
+    }
+    parent.removeChild(element);
+    return children;
+  }
+
+  function restoreUnwrap(record: UnwrapRecord): void {
+    restore(record.element, record.from);
+    for (const child of record.children) {
+      record.element.appendChild(child);
+    }
+  }
+
+  function setChildren(element: Element, children: ChildNode[]): void {
+    element.replaceChildren(...children);
+  }
+
   function applyRecord(record: MoveRecord, direction: "from" | "to"): void {
     if (record.kind === "dom") {
       restore(record.element, record[direction]);
@@ -182,6 +255,38 @@ export function createDomMoveSession(): DomMoveSession {
       for (const change of record.changes) {
         change.element.style.transform = change[direction];
       }
+      return;
+    }
+
+    if (record.kind === "delete") {
+      if (direction === "from") {
+        restoreGroup(record.elements, record.from);
+      } else {
+        detachGroup(record.elements);
+      }
+      return;
+    }
+
+    if (record.kind === "unwrap") {
+      if (direction === "from") {
+        restoreUnwrap(record);
+      } else {
+        unwrap(record.element);
+      }
+      return;
+    }
+
+    if (record.kind === "text") {
+      if (direction === "from") {
+        setChildren(record.element, record.from);
+      } else {
+        record.element.textContent = record.to;
+      }
+      return;
+    }
+
+    if (record.kind === "borderRadius") {
+      record.element.style.borderRadius = record[direction];
       return;
     }
 
@@ -240,6 +345,60 @@ export function createDomMoveSession(): DomMoveSession {
       return true;
     },
 
+    deleteElements(elements) {
+      if (elements.length === 0 || !elements.every(isAllowedDelete)) return false;
+
+      const from = elements.map((element) => ({
+        parent: element.parentNode!,
+        nextSibling: element.nextSibling
+      }));
+
+      detachGroup(elements);
+
+      undoStack.push({
+        kind: "delete",
+        elements: [...elements],
+        from
+      });
+      redoStack.length = 0;
+      return true;
+    },
+
+    unwrapElement(element) {
+      if (!isAllowedUnwrap(element)) return false;
+
+      const from = {
+        parent: element.parentNode!,
+        nextSibling: element.nextSibling
+      };
+      const children = unwrap(element);
+
+      undoStack.push({
+        kind: "unwrap",
+        element,
+        children,
+        from
+      });
+      redoStack.length = 0;
+      return true;
+    },
+
+    replaceText(element, text, originalChildren) {
+      if (!isAllowedTextEdit(element)) return false;
+
+      const from = originalChildren ? [...originalChildren] : [...element.childNodes];
+      element.textContent = text;
+
+      undoStack.push({
+        kind: "text",
+        element,
+        from,
+        to: text
+      });
+      redoStack.length = 0;
+      return true;
+    },
+
     resize(element, dimensions) {
       if (!(element instanceof HTMLElement)) return false;
 
@@ -256,6 +415,22 @@ export function createDomMoveSession(): DomMoveSession {
         element,
         from,
         to: dimensions
+      });
+      redoStack.length = 0;
+      return true;
+    },
+
+    borderRadius(element, borderRadius) {
+      if (!(element instanceof HTMLElement)) return false;
+
+      const from = element.style.borderRadius;
+      element.style.borderRadius = borderRadius;
+
+      undoStack.push({
+        kind: "borderRadius",
+        element,
+        from,
+        to: borderRadius
       });
       redoStack.length = 0;
       return true;

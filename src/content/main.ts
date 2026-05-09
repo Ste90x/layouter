@@ -1,5 +1,7 @@
-import { createDomMoveSession, type DropPosition, isAllowedGroupMove, isAllowedMove, isCriticalElement, isVisibleElement } from "./domMover";
+import { calculateBorderRadius } from "./borderRadius";
+import { createDomMoveSession, type DropPosition, isAllowedGroupMove, isAllowedMove, isAllowedTextEdit, isCriticalElement, isVisibleElement } from "./domMover";
 import { getSelectionModeClass, toggleEditActionMode, type EditActionMode } from "./editModes";
+import { applyFreeMoveAxisLock } from "./freeMove";
 import { getHistoryShortcut } from "./historyShortcuts";
 import { blockPageEventWhenEditModeActive, stopPageEventWhenEditModeActive } from "./interactionGuards";
 import { calculateResize, type ResizeCorner } from "./resize";
@@ -28,6 +30,7 @@ const GHOST_CLASS = "layouter-ghost";
 const SELECTED_CLASS = "layouter-selected";
 const SELECTED_MODE_CLASSES = ["layouter-selected-mode-dom", "layouter-selected-mode-free"];
 const EXTENSION_ROOT_ATTR = "data-layouter-extension-root";
+type ResizeHandleMode = "resize" | "borderRadius";
 
 let hoveredElement: Element | null = null;
 let selectedElements = new Set<Element>();
@@ -35,27 +38,40 @@ let draggedElements: Element[] = [];
 let dropTarget: Element | null = null;
 let dropPosition: DropPosition | null = null;
 let actionMode: EditActionMode = "dom";
+let resizeHandleMode: ResizeHandleMode = "resize";
 let handleMenuOpen = false;
 let pendingHandleDrag: { pointerId: number; x: number; y: number } | null = null;
 let selectionDragStart: { pointerId: number; x: number; y: number } | null = null;
 let freeDragStart: { x: number; y: number; initialTransforms: Map<Element, string> } | null = null;
 let resizeDragStart: {
+  borderRadiusStyle: string;
   corner: ResizeCorner;
   height: number;
+  maxRadius: number;
   pointerId: number;
+  radius: number;
   width: number;
   x: number;
   y: number;
 } | null = null;
 let suppressHandleClick = false;
 let suppressSelectionClick = false;
+let textEditState: {
+  draftText: string;
+  element: HTMLElement;
+  originalChildren: ChildNode[];
+  selectionAll: boolean;
+} | null = null;
 
 const handle = createHandle();
 const handleMenu = createMenu("layouter-handle-menu");
+const textEditToolbar = createMenu("layouter-text-edit-toolbar");
 const resizeHandles = createResizeHandles();
 const marquee = createMarquee();
+const editToggle = createEditToggle();
 
 installStyles();
+syncEditToggle();
 wireMessages();
 wireEvents();
 
@@ -63,9 +79,7 @@ function wireMessages(): void {
   chrome.runtime.onMessage.addListener((message: LayouterCommand, _sender, sendResponse) => {
     try {
       if (message.type === "SET_EDIT_MODE") {
-        session.setEditMode(message.enabled);
-        cleanupTransientState();
-        if (!message.enabled) clearSelection();
+        setEditMode(message.enabled);
       } else if (message.type === "UNDO") {
         session.undo();
         syncHandle();
@@ -86,8 +100,16 @@ function wireMessages(): void {
   });
 }
 
+function setEditMode(enabled: boolean): void {
+  if (!enabled) cancelTextEdit();
+  session.setEditMode(enabled);
+  cleanupTransientState();
+  if (!enabled) clearSelection();
+  syncEditToggle();
+}
+
 function wireEvents(): void {
-  for (const eventName of ["pointermove", "pointerdown", "pointerup", "pointercancel", "contextmenu", "click", "keydown"] as const) {
+  for (const eventName of ["pointermove", "pointerdown", "pointerup", "pointercancel", "contextmenu", "click", "keydown", "beforeinput", "input"] as const) {
     document.addEventListener(eventName, handleLayouterEvent, true);
   }
 
@@ -98,6 +120,8 @@ function wireEvents(): void {
 
 function handleLayouterEvent(event: Event): void {
   if (!session.status().editModeEnabled) return;
+
+  if (textEditState && handleTextEditEvent(event)) return;
 
   if (event instanceof MouseEvent && event.type === "contextmenu") {
     handleContextMenu(event);
@@ -117,6 +141,8 @@ function handleLayouterEvent(event: Event): void {
 }
 
 function handlePointerEvent(event: PointerEvent): void {
+  if (textEditState) return;
+
   if (selectionDragStart && event.pointerId === selectionDragStart.pointerId) {
     handleSelectionDrag(event);
     return;
@@ -263,9 +289,12 @@ function handleResizePointerDown(event: PointerEvent): void {
 
   const rect = selectedElement.getBoundingClientRect();
   resizeDragStart = {
+    borderRadiusStyle: selectedElement.style.borderRadius,
     corner,
     height: rect.height,
+    maxRadius: Math.min(rect.width, rect.height) / 2,
     pointerId: event.pointerId,
+    radius: getElementBorderRadius(selectedElement),
     width: rect.width,
     x: event.clientX,
     y: event.clientY
@@ -287,6 +316,11 @@ function handleResizeDrag(event: PointerEvent): void {
   }
 
   if (event.type !== "pointermove" && event.type !== "pointerup") return;
+
+  if (resizeHandleMode === "borderRadius") {
+    handleBorderRadiusDrag(event, selectedElement);
+    return;
+  }
 
   const next = calculateResize({
     corner: resizeDragStart.corner,
@@ -314,11 +348,37 @@ function handleResizeDrag(event: PointerEvent): void {
   syncHandle();
 }
 
+function handleBorderRadiusDrag(event: PointerEvent, selectedElement: HTMLElement): void {
+  if (!resizeDragStart) return;
+  const next = calculateBorderRadius({
+    corner: resizeDragStart.corner,
+    deltaX: event.clientX - resizeDragStart.x,
+    deltaY: event.clientY - resizeDragStart.y,
+    maxRadius: resizeDragStart.maxRadius,
+    startRadius: resizeDragStart.radius
+  });
+
+  if (event.type === "pointermove") {
+    selectedElement.style.borderRadius = `${next}px`;
+    syncHandle();
+    return;
+  }
+
+  const borderRadius = `${next}px`;
+  selectedElement.style.borderRadius = resizeDragStart.borderRadiusStyle;
+  session.borderRadius(selectedElement, borderRadius);
+  releaseResizePointerCapture();
+  resizeDragStart = null;
+  syncHandle();
+}
+
 function handleContextMenu(event: MouseEvent): void {
   if (!isExtensionEvent(event)) closeMenus();
 }
 
 function handlePageClick(event: MouseEvent): void {
+  if (textEditState) return;
+
   if (suppressSelectionClick) {
     suppressSelectionClick = false;
     return;
@@ -339,6 +399,8 @@ function handlePageClick(event: MouseEvent): void {
 }
 
 function handleKeyDown(event: KeyboardEvent): void {
+  if (textEditState) return;
+
   const historyShortcut = getHistoryShortcut(event);
   if (historyShortcut && !hasActiveInteraction()) {
     if (historyShortcut === "undo") {
@@ -359,6 +421,25 @@ function handleKeyDown(event: KeyboardEvent): void {
     return;
   }
 
+  if (event.key === "Delete" && selectedElements.size > 0 && !hasActiveInteraction()) {
+    if (session.deleteElements(getSelectedElementsInDocumentOrder())) {
+      clearSelection();
+      closeMenus();
+      clearDrop();
+      clearHover();
+    }
+    return;
+  }
+
+  if (isTextEditStartKey(event) && selectedElements.size === 1 && !hasActiveInteraction()) {
+    const selectedElement = getSingleSelectedElement();
+    if (selectedElement instanceof HTMLElement && isAllowedTextEdit(selectedElement)) {
+      startTextEdit(selectedElement);
+      applyTextEditKey(event);
+    }
+    return;
+  }
+
   if (event.key === "Tab" && selectedElements.size > 0 && draggedElements.length === 0) {
     actionMode = toggleEditActionMode(actionMode);
     closeMenus();
@@ -368,7 +449,11 @@ function handleKeyDown(event: KeyboardEvent): void {
 }
 
 function hasActiveInteraction(): boolean {
-  return Boolean(draggedElements.length > 0 || pendingHandleDrag || resizeDragStart || selectionDragStart);
+  return Boolean(draggedElements.length > 0 || pendingHandleDrag || resizeDragStart || selectionDragStart || textEditState);
+}
+
+function isTextEditStartKey(event: KeyboardEvent): boolean {
+  return event.key.length === 1 && !event.metaKey && !event.ctrlKey && !event.altKey;
 }
 
 function blockPageEvent(event: Event): void {
@@ -388,8 +473,8 @@ function stopPageEvent(event: Event): void {
 
 function openHandleMenu(): void {
   if (selectedElements.size === 0) return;
-  handleMenuOpen = true;
-  handleMenu.replaceChildren(
+  const singleSelectedElement = getSingleSelectedElement();
+  const menuButtons = [
     makeMenuButton("Move in DOM", () => {
       actionMode = "dom";
       closeMenus();
@@ -402,7 +487,38 @@ function openHandleMenu(): void {
       syncSelectionMode();
       syncHandle();
     })
-  );
+  ];
+
+  if (singleSelectedElement instanceof HTMLElement) {
+    menuButtons.push(makeMenuButton(
+      resizeHandleMode === "resize" ? "Use radius handles" : "Use resize handles",
+      () => {
+        resizeHandleMode = resizeHandleMode === "resize" ? "borderRadius" : "resize";
+        closeMenus();
+        syncHandle();
+      }
+    ));
+  }
+
+  if (singleSelectedElement instanceof HTMLElement && isAllowedTextEdit(singleSelectedElement)) {
+    menuButtons.push(makeMenuButton("Change text", () => {
+      startTextEdit(singleSelectedElement);
+    }));
+  }
+
+  if (singleSelectedElement && singleSelectedElement.childNodes.length > 0) {
+    menuButtons.push(makeMenuButton("Remove wrapper", () => {
+      if (session.unwrapElement(singleSelectedElement)) {
+        clearSelection();
+        clearDrop();
+        clearHover();
+      }
+      closeMenus();
+    }));
+  }
+
+  handleMenuOpen = true;
+  handleMenu.replaceChildren(...menuButtons);
 
   const rect = handle.getBoundingClientRect();
   positionMenu(handleMenu, rect.left, rect.bottom + 6);
@@ -474,6 +590,32 @@ function createMarquee(): HTMLDivElement {
   return element;
 }
 
+function createEditToggle(): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "layouter-edit-toggle";
+  button.setAttribute(EXTENSION_ROOT_ATTR, "true");
+  button.title = "Toggle Layouter Edit Mode";
+  button.ariaLabel = "Toggle Layouter Edit Mode";
+  button.addEventListener("pointerdown", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+  });
+  button.addEventListener("click", (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    setEditMode(!session.status().editModeEnabled);
+  });
+  document.documentElement.append(button);
+  return button;
+}
+
+function syncEditToggle(): void {
+  editToggle.dataset.editMode = session.status().editModeEnabled ? "on" : "off";
+  editToggle.title = session.status().editModeEnabled ? "Turn Layouter off" : "Turn Layouter on";
+  editToggle.ariaLabel = editToggle.title;
+}
+
 function showMarquee(x: number, y: number, width: number, height: number): void {
   marquee.hidden = false;
   marquee.style.left = `${x}px`;
@@ -509,7 +651,122 @@ function closeMenus(): void {
   handleMenuOpen = false;
 }
 
+function startTextEdit(element: HTMLElement): void {
+  cancelTextEdit();
+  const originalChildren = [...element.childNodes];
+  const initialText = element.textContent ?? "";
+  textEditState = { draftText: initialText, element, originalChildren, selectionAll: true };
+  closeMenus();
+  clearHover();
+  hideResizeHandles();
+  element.replaceChildren(document.createTextNode(initialText));
+  element.classList.add("layouter-text-editing");
+  element.focus();
+  selectElementText(element);
+  syncTextEditToolbar();
+}
+
+function commitTextEdit(): void {
+  if (!textEditState) return;
+  const { element, originalChildren } = textEditState;
+  const nextText = textEditState.draftText;
+  element.classList.remove("layouter-text-editing");
+  textEditState = null;
+  textEditToolbar.hidden = true;
+  session.replaceText(element, nextText, originalChildren);
+  clearSelection();
+}
+
+function cancelTextEdit(): void {
+  if (!textEditState) return;
+  const { element, originalChildren } = textEditState;
+  element.classList.remove("layouter-text-editing");
+  element.replaceChildren(...originalChildren);
+  textEditState = null;
+  textEditToolbar.hidden = true;
+  syncHandle();
+}
+
+function syncTextEditToolbar(): void {
+  if (!textEditState) return;
+  textEditToolbar.replaceChildren(
+    makeMenuButton("Confirm text", commitTextEdit),
+    makeMenuButton("Cancel", cancelTextEdit)
+  );
+  const rect = textEditState.element.getBoundingClientRect();
+  positionMenu(textEditToolbar, rect.left, rect.bottom + 6);
+}
+
+function handleTextEditEvent(event: Event): boolean {
+  if (!textEditState) return false;
+  if (event instanceof KeyboardEvent) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    applyTextEditKey(event);
+    return true;
+  }
+  if (isExtensionEvent(event)) return false;
+  if (event instanceof InputEvent) {
+    event.preventDefault();
+    event.stopImmediatePropagation();
+    return true;
+  }
+  if (!(event.target instanceof Node) || !textEditState.element.contains(event.target)) return false;
+  event.stopImmediatePropagation();
+  return true;
+}
+
+function applyTextEditKey(event: KeyboardEvent): void {
+  if (!textEditState) return;
+
+  if (event.key === "Enter" && !event.shiftKey) {
+    commitTextEdit();
+    return;
+  }
+
+  if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === "a") {
+    textEditState.selectionAll = true;
+    selectElementText(textEditState.element);
+    return;
+  }
+
+  if (event.key === "Backspace" || event.key === "Delete") {
+    textEditState.draftText = textEditState.selectionAll ? "" : textEditState.draftText.slice(0, -1);
+    textEditState.selectionAll = false;
+    renderTextEditDraft();
+    return;
+  }
+
+  if (event.key.length !== 1 || event.metaKey || event.ctrlKey || event.altKey) return;
+
+  textEditState.draftText = textEditState.selectionAll ? event.key : `${textEditState.draftText}${event.key}`;
+  textEditState.selectionAll = false;
+  renderTextEditDraft();
+}
+
+function renderTextEditDraft(): void {
+  if (!textEditState) return;
+  textEditState.element.textContent = textEditState.draftText;
+  const selection = window.getSelection();
+  if (!selection) return;
+  selection.removeAllRanges();
+  const range = document.createRange();
+  range.selectNodeContents(textEditState.element);
+  range.collapse(false);
+  selection.addRange(range);
+}
+
+function selectElementText(element: HTMLElement): void {
+  const selection = window.getSelection();
+  if (!selection) return;
+  const range = document.createRange();
+  range.selectNodeContents(element);
+  selection.removeAllRanges();
+  selection.addRange(range);
+}
+
 function selectElements(elements: Element[]): void {
+  cancelTextEdit();
   clearSelection();
   selectedElements = new Set(normalizeSelection(elements));
   for (const element of selectedElements) element.classList.add(SELECTED_CLASS);
@@ -537,6 +794,7 @@ function clearSelection(): void {
 }
 
 function cleanupTransientState(): void {
+  cancelTextEdit();
   cancelDrag();
   closeMenus();
   clearHover();
@@ -669,8 +927,7 @@ function inferDropPosition(target: Element, event: PointerEvent): DropPosition {
 
 function updateFreeDrag(event: PointerEvent): void {
   if (draggedElements.length === 0 || !freeDragStart) return;
-  const dx = event.clientX - freeDragStart.x;
-  const dy = event.clientY - freeDragStart.y;
+  const { dx, dy } = getFreeDragDelta(event);
   for (const element of draggedElements) {
     if (!(element instanceof HTMLElement)) continue;
     const initialTransform = freeDragStart.initialTransforms.get(element) ?? "";
@@ -681,8 +938,7 @@ function updateFreeDrag(event: PointerEvent): void {
 
 function commitFreeDrag(event: PointerEvent): void {
   if (draggedElements.length === 0 || !freeDragStart) return;
-  const dx = event.clientX - freeDragStart.x;
-  const dy = event.clientY - freeDragStart.y;
+  const { dx, dy } = getFreeDragDelta(event);
   const changes = draggedElements.flatMap((element) => {
     if (!(element instanceof HTMLElement)) return [];
     const initialTransform = freeDragStart?.initialTransforms.get(element) ?? "";
@@ -697,8 +953,26 @@ function commitFreeDrag(event: PointerEvent): void {
   }
 }
 
+function getFreeDragDelta(event: PointerEvent): { dx: number; dy: number } {
+  if (!freeDragStart) return { dx: 0, dy: 0 };
+  return applyFreeMoveAxisLock(
+    {
+      dx: event.clientX - freeDragStart.x,
+      dy: event.clientY - freeDragStart.y
+    },
+    {
+      controlKey: event.ctrlKey,
+      shiftKey: event.shiftKey
+    }
+  );
+}
+
 function getElementTransform(element: Element): string {
   return element instanceof HTMLElement ? element.style.transform : "";
+}
+
+function getElementBorderRadius(element: HTMLElement): number {
+  return parseFloat(window.getComputedStyle(element).borderTopLeftRadius) || 0;
 }
 
 function syncHandle(): void {
@@ -776,6 +1050,9 @@ function syncResizeHandles(rect: DOMRect): void {
     const point = points[corner];
     const resizeHandle = resizeHandles[corner];
     resizeHandle.hidden = false;
+    resizeHandle.dataset.handleMode = resizeHandleMode;
+    resizeHandle.title = resizeHandleMode === "resize" ? `Resize ${corner.toUpperCase()}` : `Round corners ${corner.toUpperCase()}`;
+    resizeHandle.ariaLabel = resizeHandle.title;
     resizeHandle.style.cursor = point.cursor;
     resizeHandle.style.left = `${point.x - 6}px`;
     resizeHandle.style.top = `${point.y - 6}px`;
@@ -831,7 +1108,8 @@ function installStyles(): void {
       outline-offset: -3px !important;
     }
 
-    .layouter-handle-menu {
+    .layouter-handle-menu,
+    .layouter-text-edit-toolbar {
       position: fixed !important;
       z-index: 2147483647 !important;
       display: grid !important;
@@ -846,6 +1124,7 @@ function installStyles(): void {
     }
 
     .layouter-handle-menu[hidden],
+    .layouter-text-edit-toolbar[hidden],
     .layouter-handle[hidden],
     .layouter-resize-handle[hidden],
     .layouter-selection-marquee[hidden] {
@@ -853,7 +1132,9 @@ function installStyles(): void {
     }
 
     .layouter-handle-menu button,
-    .layouter-handle {
+    .layouter-text-edit-toolbar button,
+    .layouter-handle,
+    .layouter-edit-toggle {
       appearance: none !important;
       border: 1px solid #cbd5e1 !important;
       border-radius: 5px !important;
@@ -863,6 +1144,42 @@ function installStyles(): void {
       font: 13px/1.2 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif !important;
       padding: 7px 9px !important;
       text-align: left !important;
+    }
+
+    .layouter-edit-toggle {
+      position: fixed !important;
+      z-index: 2147483647 !important;
+      left: 0 !important;
+      top: 0 !important;
+      width: 28px !important;
+      height: 28px !important;
+      min-width: 28px !important;
+      padding: 0 !important;
+      border: 0 !important;
+      border-radius: 0 !important;
+      background: #64748b !important;
+      clip-path: polygon(0 0, 100% 0, 0 100%) !important;
+      cursor: pointer !important;
+      opacity: 0.45 !important;
+      text-align: initial !important;
+    }
+
+    .layouter-edit-toggle:hover,
+    .layouter-edit-toggle:focus-visible {
+      opacity: 0.9 !important;
+      outline: 2px solid #ffffff !important;
+      outline-offset: 1px !important;
+    }
+
+    .layouter-edit-toggle[data-edit-mode="on"] {
+      background: #16a34a !important;
+      opacity: 0.9 !important;
+    }
+
+    .layouter-text-editing {
+      outline: 2px solid #22c55e !important;
+      outline-offset: 2px !important;
+      cursor: text !important;
     }
 
     .layouter-handle {
@@ -909,6 +1226,10 @@ function installStyles(): void {
       border-radius: 50% !important;
       background: #2563eb !important;
       box-shadow: 0 1px 5px rgb(15 23 42 / 0.25) !important;
+    }
+
+    .layouter-resize-handle[data-handle-mode="borderRadius"] {
+      background: #16a34a !important;
     }
 
     .layouter-selection-marquee {

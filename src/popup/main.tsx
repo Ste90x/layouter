@@ -73,7 +73,7 @@ async function sendCommand(command: LayouterCommand): Promise<void> {
 
       <footer>
         <span>{status.moveCount} moves</span>
-        <span>Alt/Option + drag</span>
+        <span>Triangle toggles Edit Mode</span>
       </footer>
 
       {error ? <p className="error">{error}</p> : null}

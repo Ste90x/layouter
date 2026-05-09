@@ -9,6 +9,12 @@ const manifest: ManifestV3Export = {
     default_popup: "index.html",
     default_title: "Layouter"
   },
+  content_scripts: [
+    {
+      matches: ["http://*/*", "https://*/*"],
+      js: ["src/content/main.ts"]
+    }
+  ],
   permissions: ["activeTab", "scripting"],
   background: {
     service_worker: "src/background.ts",
